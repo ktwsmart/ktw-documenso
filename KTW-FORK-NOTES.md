@@ -18,3 +18,6 @@
 ## 部署
 - 本 fork 部署於 KTW Zeabur `ktw-smart` 專案，**僅內網/Tailscale，不對公網開放**。
 - 整合規格見平台 repo：`docs/PLATFORM-DOCUMENSO-INTEGRATION-SPEC.md`。
+
+## Zeabur 部署設定
+- `zbpack.json` 指向上游 `docker/Dockerfile`（Zeabur 預設只找根目錄 Dockerfile；此設定讓它改用 Documenso 自己的 Dockerfile，**不複製、不改上游結構**）。設定放 repo ＝版控統一、誰部署都一致。
