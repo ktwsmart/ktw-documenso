@@ -21,7 +21,21 @@ export async function dynamicActivate(locale: string) {
 }
 
 const parseLanguageFromLocale = (locale: string): SupportedLanguageCodes | null => {
-  const [language, _country] = locale.split('-');
+  // Strip any quality weight (e.g. "zh-TW;q=0.9" -> "zh-TW").
+  const normalizedLocale = locale.split(';')[0].trim();
+
+  // Prefer an exact full-locale match (e.g. zh-TW) before falling back to the
+  // language-only match (e.g. zh), so region-specific catalogues (zh-TW, pt-BR)
+  // are honoured instead of always collapsing to the base language.
+  const exactMatch = APP_I18N_OPTIONS.supportedLangs.find(
+    (lang): lang is SupportedLanguageCodes => lang === normalizedLocale,
+  );
+
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const [language, _country] = normalizedLocale.split('-');
 
   const foundSupportedLanguage = APP_I18N_OPTIONS.supportedLangs.find(
     (lang): lang is SupportedLanguageCodes => lang === language,
