@@ -19,5 +19,6 @@
 - 本 fork 部署於 KTW Zeabur `ktw-smart` 專案，**僅內網/Tailscale，不對公網開放**。
 - 整合規格見平台 repo：`docs/PLATFORM-DOCUMENSO-INTEGRATION-SPEC.md`。
 
-## Zeabur 部署設定
-- `zbpack.json` 指向上游 `docker/Dockerfile`（Zeabur 預設只找根目錄 Dockerfile；此設定讓它改用 Documenso 自己的 Dockerfile，**不複製、不改上游結構**）。設定放 repo ＝版控統一、誰部署都一致。
+## Zeabur 部署（照 ktw-saas-platform 標準）
+- **CI 預建 image → GHCR → Zeabur PREBUILT**：`.github/workflows/deploy.yml` 在 push main 時用 GitHub runner build 上游 `docker/Dockerfile`（runner 階段）→ 推 `ghcr.io/ktwsmart/ktw-documenso` → 觸發 Zeabur 拉新 image。
+- 不複製 Dockerfile、不讓 Zeabur 從源碼 build（重 build 由 16G runner 扛）。需 repo secret `ZEABUR_API_TOKEN` + var `ZEABUR_SERVICE_ID`。
