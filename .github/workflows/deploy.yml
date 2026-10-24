@@ -53,6 +53,17 @@ jobs:
           docker push ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:sha-${{ steps.meta.outputs.sha12 }}
           docker push ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:latest
 
+      # GitHub 運算式的 == 不分大小寫（K3S 也會走新叢集步驟）；先以精確比較把關，整段 job 只接受空值或 k3s（對齊平台 PR #771）
+      - name: 驗證部署目的地開關只接受空值或 k3s
+        env:
+          KTW_DEPLOY_TARGET: ${{ vars.KTW_DEPLOY_TARGET }}
+        run: |
+          set -euo pipefail
+          case "$KTW_DEPLOY_TARGET" in
+            '') echo "部署目的地：Zeabur（未切換）";;
+            k3s) echo "部署目的地：GCP 新叢集（k3s）";;
+            *) echo "::error::vars.KTW_DEPLOY_TARGET 只接受空值或 k3s（精確比較），實際值不合法"; exit 1;;
+          esac
       - name: 觸發 Zeabur 部署
         if: vars.ZEABUR_SERVICE_ID != '' && vars.ZEABUR_SERVICE_ID != 'pending' && vars.KTW_DEPLOY_TARGET != 'k3s'
         run: |
@@ -64,7 +75,8 @@ jobs:
           if echo "$OUT" | grep -qiE "ERROR|unknown flag|unknown command"; then exit 1; fi
         env:
           ZEABUR_TOKEN: ${{ secrets.ZEABUR_API_TOKEN }}
-      # 撤離 Zeabur 後：新叢集 API 只開在 tailnet；以 OAuth client 換 10 分鐘 ephemeral、tag:ci 的 auth key 加入，kubeconfig 的 ServiceAccount 只能改 ktw-prod 的部署；job 結束登出
+      # 撤離 Zeabur 後：新叢集 API 只開在 tailnet；以 OAuth client 換 10 分鐘 ephemeral、tag:ci 的 auth key 加入，kubeconfig 的 ServiceAccount 只能改 ktw-prod 的部署；job 結束登出。
+      # 做法對齊平台 PR #771（Codex R1 必修）：衍生憑證立即遮蔽、tailscale 釘版、kubectl 釘版＋sha256、--request-timeout、部署空窗、映像以 digest 綁定並於部署後斷言、當次專用 kubeconfig。
       - name: 以短效節點加入 tailnet（僅新叢集）
         if: vars.KTW_DEPLOY_TARGET == 'k3s'
         env:
@@ -74,29 +86,91 @@ jobs:
           set -euo pipefail
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt-get update -qq && sudo apt-get install -y -qq tailscale >/dev/null
+          # 釘版：apt 倉庫保留歷史版本，指定版本不存在時 apt 直接失敗（fail-closed）；升版改這裡並重審
+          TAILSCALE_VERSION=1.102.4
+          sudo apt-get update -qq && sudo apt-get install -y -qq "tailscale=$TAILSCALE_VERSION" >/dev/null
           ACCESS_TOKEN=$(curl -fsS --max-time 20 -d "client_id=$TS_OAUTH_CLIENT_ID" -d "client_secret=$TS_OAUTH_SECRET" https://api.tailscale.com/api/v2/oauth/token | jq -er '.access_token')
+          echo "::add-mask::$ACCESS_TOKEN"
           AUTH_KEY=$(curl -fsS --max-time 20 -u "$ACCESS_TOKEN:" -H 'Content-Type: application/json' \
             -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":600,"description":"gha-'"$GITHUB_RUN_ID"'"}' \
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -er '.key')
+          echo "::add-mask::$AUTH_KEY"
           sudo tailscale up --auth-key "$AUTH_KEY" --hostname "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --accept-dns=false --accept-routes=false --timeout 60s
           unset ACCESS_TOKEN AUTH_KEY
-      - name: 滾動更新新叢集部署並等待就緒（僅新叢集）
+      - name: 安裝釘版 kubectl 並寫入當次專用 kubeconfig（僅新叢集）
         if: vars.KTW_DEPLOY_TARGET == 'k3s'
         env:
           KUBECONFIG_B64: ${{ secrets.KTW_PROD_KUBECONFIG }}
-          TARGET_IMAGE: ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:sha-${{ steps.meta.outputs.sha12 }}
         run: |
           set -euo pipefail
           curl -fsSLo "$RUNNER_TEMP/kubectl" https://dl.k8s.io/release/v1.32.4/bin/linux/amd64/kubectl
           echo "10d739e9af8a59c9e7a730a2445916e04bc9cbb44bc79d22ce460cd329fa076c  $RUNNER_TEMP/kubectl" | sha256sum -c -
           sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
-          umask 077; mkdir -p "$HOME/.kube"; printf '%s' "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
-          kubectl -n ktw-prod set image "deploy/ghcrioktwsmartktw-documensolatest" "app=$TARGET_IMAGE"
-          kubectl -n ktw-prod rollout status "deploy/ghcrioktwsmartktw-documensolatest" --timeout=600s
-          kubectl -n ktw-prod get deploy "ghcrioktwsmartktw-documensolatest" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
-      - name: 離開 tailnet 並清除 kubeconfig（僅新叢集）
-        if: always() && vars.KTW_DEPLOY_TARGET == 'k3s'
+          umask 077
+          install -d -m 0700 "$RUNNER_TEMP/kube"
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kube/config"
+          chmod 0600 "$RUNNER_TEMP/kube/config"
+          # 只寫路徑（非機密）到 GITHUB_ENV，後續步驟以 --kubeconfig 明確指定
+          echo "KUBECONFIG_PATH=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+      - name: 等待新叢集部署空窗（僅新叢集，fail-closed）
+        if: vars.KTW_DEPLOY_TARGET == 'k3s'
+        env:
+          WATCH_DEPLOYMENTS: ghcrioktwsmartktw-documensolatest
         run: |
-          rm -rf "$HOME/.kube"
-          sudo tailscale logout 2>/dev/null || true
+          set -euo pipefail
+          DEADLINE=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            if ALL=$(kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod get deploy,pods -o json 2>/dev/null); then
+              BUSY=$(echo "$ALL" | jq -r --arg w "$WATCH_DEPLOYMENTS" '
+                ($w | split(",")) as $watch
+                | ([ .items[]
+                     | select(.kind == "Deployment" and ((.metadata.name as $n | $watch | index($n)) != null))
+                     | select(.metadata.deletionTimestamp != null
+                              or (.status.observedGeneration // -1) < .metadata.generation
+                              or (.status.updatedReplicas // 0) != (.spec.replicas // 0)
+                              or (.status.availableReplicas // 0) != (.spec.replicas // 0)
+                              or (.status.replicas // 0) != (.spec.replicas // 0))
+                     | .metadata.name ]
+                   + [ .items[]
+                       | select(.kind == "Pod" and .metadata.deletionTimestamp != null and (((.metadata.labels.app // "") as $a | $watch | index($a)) != null))
+                       | "pod/" + .metadata.name ])
+                | sort | join(",")')
+              if [ -z "$BUSY" ]; then echo "✅ 新叢集相關服務無部署進行中"; exit 0; fi
+              echo "⏳ 部署窗口佔用中：$BUSY"
+            else
+              echo "❌ 新叢集查詢失敗，15 秒後重試"
+            fi
+            sleep 15
+          done
+          echo "::error::新叢集部署空窗 10 分鐘未明確成立；fail-closed"
+          exit 1
+      - name: 以 digest 綁定映像、滾動更新新叢集並斷言 app 容器（僅新叢集）
+        if: vars.KTW_DEPLOY_TARGET == 'k3s'
+        env:
+          TARGET_IMAGE: ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:sha-${{ steps.meta.outputs.sha12 }}
+          DEPLOYMENT: ghcrioktwsmartktw-documensolatest
+        run: |
+          set -euo pipefail
+          # 同一提交重建覆寫 tag 時 set image 字串不變、不會觸發更新，故一律解析本次推送的 digest 並以 image@digest 部署
+          DIGEST=$(docker buildx imagetools inspect "$TARGET_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          REPO="${TARGET_IMAGE%:*}"
+          kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod set image "deploy/$DEPLOYMENT" "app=$REPO@$DIGEST"
+          kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod rollout status "deploy/$DEPLOYMENT" --timeout=600s
+          ACTUAL=$(kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod get deploy "$DEPLOYMENT" -o jsonpath='{.spec.template.spec.containers[?(@.name=="app")].image}')
+          if [ "$ACTUAL" != "$REPO@$DIGEST" ]; then
+            echo "::error::部署結果的 app 容器映像是 ${ACTUAL:-<空>}，不是本次建置的 $REPO@$DIGEST"
+            exit 1
+          fi
+          echo "已部署 $ACTUAL"
+      - name: 清除當次 kubeconfig（僅新叢集）
+        if: always() && vars.KTW_DEPLOY_TARGET == 'k3s'
+        run: rm -rf "$RUNNER_TEMP/kube"
+      - name: 離開 tailnet（僅新叢集；失敗保留訊號但不改變部署結果）
+        if: always() && vars.KTW_DEPLOY_TARGET == 'k3s'
+        continue-on-error: true
+        run: |
+          if ! timeout 30 sudo tailscale logout; then
+            echo "::warning::tailscale logout 失敗或逾時；ephemeral 節點會在 key 到期後自動消失"
+            exit 1
+          fi
