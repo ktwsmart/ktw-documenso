@@ -153,7 +153,8 @@ jobs:
           set -euo pipefail
           # 同一提交重建覆寫 tag 時 set image 字串不變、不會觸發更新，故一律解析本次推送的 digest 並以 image@digest 部署
           DIGEST=$(docker buildx imagetools inspect "$TARGET_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          # 整字串比對（grep 按行比對會放過「合法摘要＋換行＋其他文字」；Codex R2 建議）
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::digest 格式不合法"; exit 1; }
           REPO="${TARGET_IMAGE%:*}"
           kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod set image "deploy/$DEPLOYMENT" "app=$REPO@$DIGEST"
           kubectl --kubeconfig "$KUBECONFIG_PATH" --request-timeout=20s -n ktw-prod rollout status "deploy/$DEPLOYMENT" --timeout=600s
