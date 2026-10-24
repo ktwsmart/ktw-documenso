@@ -88,7 +88,9 @@ jobs:
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
           # 釘版：apt 倉庫保留歷史版本，指定版本不存在時 apt 直接失敗（fail-closed）；升版改這裡並重審
           TAILSCALE_VERSION=1.102.4
-          sudo apt-get update -qq && sudo apt-get install -y -qq "tailscale=$TAILSCALE_VERSION" >/dev/null
+          # 兩行分開：&& 左側失敗不會被 set -e 終止；apt 更新失敗就停，不讓 runner 既有版本繞過釘版（Codex 建議）
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq "tailscale=$TAILSCALE_VERSION" >/dev/null
           ACCESS_TOKEN=$(curl -fsS --max-time 20 -d "client_id=$TS_OAUTH_CLIENT_ID" -d "client_secret=$TS_OAUTH_SECRET" https://api.tailscale.com/api/v2/oauth/token | jq -er '.access_token')
           echo "::add-mask::$ACCESS_TOKEN"
           AUTH_KEY=$(curl -fsS --max-time 20 -u "$ACCESS_TOKEN:" -H 'Content-Type: application/json' \
@@ -172,6 +174,6 @@ jobs:
         continue-on-error: true
         run: |
           if ! timeout 30 sudo tailscale logout; then
-            echo "::warning::tailscale logout 失敗或逾時；ephemeral 節點會在 key 到期後自動消失"
+            echo "::warning::tailscale logout 失敗或逾時；此節點為 ephemeral，離線後由 Tailscale 自動移除（官方：通常為最後活動後 30～60 分鐘）；auth key 到期不會撤銷已加入節點"
             exit 1
           fi
