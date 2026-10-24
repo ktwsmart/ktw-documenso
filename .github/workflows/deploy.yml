@@ -54,7 +54,7 @@ jobs:
           docker push ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:latest
 
       - name: 觸發 Zeabur 部署
-        if: vars.ZEABUR_SERVICE_ID != '' && vars.ZEABUR_SERVICE_ID != 'pending'
+        if: vars.ZEABUR_SERVICE_ID != '' && vars.ZEABUR_SERVICE_ID != 'pending' && vars.KTW_DEPLOY_TARGET != 'k3s'
         run: |
           OUT=$(npx zeabur@latest service update tag \
             --id ${{ vars.ZEABUR_SERVICE_ID }} \
@@ -64,3 +64,39 @@ jobs:
           if echo "$OUT" | grep -qiE "ERROR|unknown flag|unknown command"; then exit 1; fi
         env:
           ZEABUR_TOKEN: ${{ secrets.ZEABUR_API_TOKEN }}
+      # 撤離 Zeabur 後：新叢集 API 只開在 tailnet；以 OAuth client 換 10 分鐘 ephemeral、tag:ci 的 auth key 加入，kubeconfig 的 ServiceAccount 只能改 ktw-prod 的部署；job 結束登出
+      - name: 以短效節點加入 tailnet（僅新叢集）
+        if: vars.KTW_DEPLOY_TARGET == 'k3s'
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq tailscale >/dev/null
+          ACCESS_TOKEN=$(curl -fsS --max-time 20 -d "client_id=$TS_OAUTH_CLIENT_ID" -d "client_secret=$TS_OAUTH_SECRET" https://api.tailscale.com/api/v2/oauth/token | jq -er '.access_token')
+          AUTH_KEY=$(curl -fsS --max-time 20 -u "$ACCESS_TOKEN:" -H 'Content-Type: application/json' \
+            -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:ci"]}}},"expirySeconds":600,"description":"gha-'"$GITHUB_RUN_ID"'"}' \
+            https://api.tailscale.com/api/v2/tailnet/-/keys | jq -er '.key')
+          sudo tailscale up --auth-key "$AUTH_KEY" --hostname "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --accept-dns=false --accept-routes=false --timeout 60s
+          unset ACCESS_TOKEN AUTH_KEY
+      - name: 滾動更新新叢集部署並等待就緒（僅新叢集）
+        if: vars.KTW_DEPLOY_TARGET == 'k3s'
+        env:
+          KUBECONFIG_B64: ${{ secrets.KTW_PROD_KUBECONFIG }}
+          TARGET_IMAGE: ghcr.io/${{ steps.meta.outputs.owner_lc }}/ktw-documenso:sha-${{ steps.meta.outputs.sha12 }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/kubectl" https://dl.k8s.io/release/v1.32.4/bin/linux/amd64/kubectl
+          echo "10d739e9af8a59c9e7a730a2445916e04bc9cbb44bc79d22ce460cd329fa076c  $RUNNER_TEMP/kubectl" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+          umask 077; mkdir -p "$HOME/.kube"; printf '%s' "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          kubectl -n ktw-prod set image "deploy/ghcrioktwsmartktw-documensolatest" "app=$TARGET_IMAGE"
+          kubectl -n ktw-prod rollout status "deploy/ghcrioktwsmartktw-documensolatest" --timeout=600s
+          kubectl -n ktw-prod get deploy "ghcrioktwsmartktw-documensolatest" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+      - name: 離開 tailnet 並清除 kubeconfig（僅新叢集）
+        if: always() && vars.KTW_DEPLOY_TARGET == 'k3s'
+        run: |
+          rm -rf "$HOME/.kube"
+          sudo tailscale logout 2>/dev/null || true
