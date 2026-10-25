@@ -21,7 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # pull_request 預設檢出合併參照（refs/pull/N/merge）；審查要求建置必須綁定受審 head 本身
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: 斷言實際檢出的提交就是受審 head
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git rev-parse HEAD)
+          test "$ACTUAL" = "${{ github.event.pull_request.head.sha }}" || { echo "::error::檢出 $ACTUAL 不是受審 head ${{ github.event.pull_request.head.sha }}"; exit 1; }
+          echo "實際檢出 SHA：$ACTUAL" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-buildx-action@v3
         with:
           driver: docker
@@ -44,7 +52,8 @@ jobs:
           BASE=$(docker image inspect "$IMG" --format '{{.Id}}')
           echo "受審 head：${{ github.event.pull_request.head.sha }}" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "映像 ID：$BASE" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "Node：$NODE；Alpine：$ALPINE；$BROTLI" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Node：$NODE；Alpine：$ALPINE；$BROTLI（brotli-libs 為資訊欄位：Node 的 Brotli 為靜態內附，門檻以 Node 版本判定）" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "部署架構：linux/amd64（docker driver 於 ubuntu-latest 建置，與 deploy.yml 相同）；映像不推送" | tee -a "$GITHUB_STEP_SUMMARY"
           # 門檻：Node 22.x 須 ≥ 22.23.4（CVE-2026-111497 官方回補版）；其他大版本另列門檻
           python3 - "$NODE" <<'PY'
           import sys,re
