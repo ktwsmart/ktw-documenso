@@ -11,6 +11,16 @@
 
 本元件只負責電子簽署（文件上傳、簽署流程、簽章 PDF、Webhook 回呼平台）；租戶與權限由平台控制，Documenso 不直接對租戶開放管理介面。產品版號沿用上游 `package.json` 的 `version`（fork 不另編號），KTW 自有變更以「來源 commit＋映像 digest」追溯。
 
+## 相容性
+
+依 `docs/KTW-RULES.md` §7.3 第 3 點，本元件為可獨立部署、升級、回復的中央服務，使用自己的產品版號（上游 2.13.0）維護本子表；它不屬於任何產業主表的「核准相容組合」列，相容性以平台契約界定：
+
+| 平台側 | Documenso 側 | 契約 | 狀態 |
+|---|---|---|---|
+| 平台 `/api/documenso/create`、`/api/documenso/webhook`（0.18.x 現役，含 0.18.143／0.18.162） | Documenso 2.13.0 API v1（`/api/v1/documents`、Webhook `document.completed`） | 平台持 Documenso API token 建立文件、Documenso 以 Webhook 回呼平台；協定自 2026-06-25 起未變 | 現役相容；本次只換容器基底 Node（22.22.3→22.23.4），不動 Documenso 程式與 API，相容組合不變 |
+
+本次基底修補不升 Documenso 產品版號、不改平台契約，故不新增或修改中央索引「現役相容組合」表；僅在本表與中央索引元件列記錄。
+
 ## 迭代版本表
 
 | 元件版本 | 日期 | Source | 狀態 | 主要內容 | 驗證與證據 | 未完成 Gate |
