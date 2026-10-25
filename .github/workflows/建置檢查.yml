@@ -1,0 +1,64 @@
+# PR 建置檢查：以受審 head 建置 runner 映像（不推送、不部署），回讀映像內 Node 與 Alpine Brotli 版本，
+# 作為合併前的建置證據（2026-10-25 HTTP2Shell 基底修補 Codex 審查要求：合併前須有綁定受審提交的建置結果）。
+# 與 deploy.yml 同用 docker driver 與 --target runner，確保證據與正式建置同路徑。
+name: 建置檢查
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 建置檢查-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # pull_request 預設檢出合併參照（refs/pull/N/merge）；審查要求建置必須綁定受審 head 本身
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: 斷言實際檢出的提交就是受審 head
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git rev-parse HEAD)
+          test "$ACTUAL" = "${{ github.event.pull_request.head.sha }}" || { echo "::error::檢出 $ACTUAL 不是受審 head ${{ github.event.pull_request.head.sha }}"; exit 1; }
+          echo "實際檢出 SHA：$ACTUAL" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - name: 建構 runner 映像（綁定受審 head，不推送）
+        run: |
+          set -euo pipefail
+          docker build \
+            --memory=12g \
+            --target runner \
+            -f docker/Dockerfile \
+            -t ktw-documenso:pr-${{ github.event.pull_request.head.sha }} \
+            .
+      - name: 回讀映像內 Node、Alpine 與 Brotli 版本並斷言達 HTTP2Shell 修補門檻
+        run: |
+          set -euo pipefail
+          IMG="ktw-documenso:pr-${{ github.event.pull_request.head.sha }}"
+          NODE=$(docker run --rm --entrypoint node "$IMG" -v)
+          ALPINE=$(docker run --rm --entrypoint cat "$IMG" /etc/alpine-release)
+          BROTLI=$(docker run --rm --entrypoint sh "$IMG" -c 'apk info -v brotli-libs 2>/dev/null || echo "brotli-libs 未安裝（Node 靜態內附）"')
+          BASE=$(docker image inspect "$IMG" --format '{{.Id}}')
+          echo "受審 head：${{ github.event.pull_request.head.sha }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "映像 ID：$BASE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Node：$NODE；Alpine：$ALPINE；$BROTLI（brotli-libs 為資訊欄位：Node 的 Brotli 為靜態內附，門檻以 Node 版本判定）" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "部署架構：linux/amd64（docker driver 於 ubuntu-latest 建置，與 deploy.yml 相同）；映像不推送" | tee -a "$GITHUB_STEP_SUMMARY"
+          # 門檻：Node 22.x 須 ≥ 22.23.4（CVE-2026-111497 官方回補版）；其他大版本另列門檻
+          python3 - "$NODE" <<'PY'
+          import sys,re
+          v=tuple(int(x) for x in re.match(r"v(\d+)\.(\d+)\.(\d+)",sys.argv[1]).groups())
+          ok={22:(22,23,4),24:(24,22,1),26:(26,12,1)}.get(v[0])
+          assert ok and v>=ok, f"Node {sys.argv[1]} 低於 HTTP2Shell 修補門檻 {ok}"
+          print("Node 版本達門檻")
+          PY
